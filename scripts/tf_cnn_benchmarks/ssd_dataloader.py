@@ -25,13 +25,13 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.contrib.data.python.ops import batching
-from object_detection.box_coders import faster_rcnn_box_coder
-from object_detection.core import box_list
-from object_detection.core import preprocessor
-from object_detection.core import region_similarity_calculator
-from object_detection.core import target_assigner
-from object_detection.data_decoders import tf_example_decoder
-from object_detection.matchers import argmax_matcher
+# from object_detection.box_coders import faster_rcnn_box_coder
+# from object_detection.core import box_list
+# from object_detection.core import preprocessor
+# from object_detection.core import region_similarity_calculator
+# from object_detection.core import target_assigner
+# from object_detection.data_decoders import tf_example_decoder
+# from object_detection.matchers import argmax_matcher
 import ssd_constants
 
 

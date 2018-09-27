@@ -37,7 +37,7 @@ import tensorflow as tf
 
 from google.protobuf import text_format
 
-from tensorflow.contrib.compiler import xla
+# from tensorflow.contrib.compiler import xla
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python import debug as tf_debug
 from tensorflow.python.client import timeline
@@ -329,7 +329,7 @@ flags.DEFINE_integer('datasets_num_private_threads', None,
                      'appropriate number. If set to 0, we use the default '
                      'tf-Compute threads for dataset operations.')
 flags.DEFINE_boolean(
-    'use_multi_device_iterator', True,
+    'use_multi_device_iterator', False,
     'If true, we use the MultiDeviceIterator for prefetching, '
     'which deterministically prefetches the data onto the '
     'various GPUs')
@@ -2587,9 +2587,15 @@ class BenchmarkCNN(object):
           gpu_compute_stage_ops.append(gpu_compute_stage_op)
       else:
         with tf.device(self.raw_devices[rel_device_num]):
-          # Minor hack to avoid H2D copy when using synthetic data
-          inputs, labels = self.model.get_synthetic_inputs_and_labels(
-              BenchmarkCNN.GPU_CACHED_INPUT_VARIABLE_NAME, data_type, nclass)
+          if isinstance(self.dataset, datasets.COCODataset):
+            # SSD uses a different way to generate labels
+            inputs, labels = self.model.get_synthetic_inputs_and_labels_coco(
+              BenchmarkCNN.GPU_CACHED_INPUT_VARIABLE_NAME, data_type, nclass,
+              self.model.get_labels_shape())
+          else:
+            # Minor hack to avoid H2D copy when using synthetic data
+            inputs, labels = self.model.get_synthetic_inputs_and_labels(
+                BenchmarkCNN.GPU_CACHED_INPUT_VARIABLE_NAME, data_type, nclass)
 
     labels_shape = self.model.get_labels_shape()
     if labels_shape:
