@@ -222,10 +222,14 @@ class CNNModel(Model):
         stddev=60,
         name=self.model_name + '_synthetic_inputs')
     inputs = tf.contrib.framework.local_variable(inputs, name=input_name)
-    labels = tf.random_uniform(
+    # labels = tf.random_uniform(
+    #     labels_shape,
+    #     minval=0,
+    #     maxval=1,
+    #     dtype=tf.float32,
+    #     name=self.model_name + '_synthetic_labels')
+    labels = tf.ones(
         labels_shape,
-        minval=0,
-        maxval=1,
         dtype=tf.float32,
         name=self.model_name + '_synthetic_labels')
     return (inputs, labels)
