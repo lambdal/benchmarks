@@ -14,6 +14,11 @@
 # ==============================================================================
 """Trivial model configuration."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import tensorflow.compat.v1 as tf
 from models import model
 
 
@@ -41,3 +46,28 @@ class TrivialCifar10Model(model.CNNModel):
     cnn.reshape([-1, 32 * 32 * 3])
     cnn.affine(1)
     cnn.affine(4096)
+
+
+class TrivialSSD300Model(model.CNNModel):
+  """Trivial SSD300 model configuration."""
+
+  def __init__(self, params=None):
+    super(TrivialSSD300Model, self).__init__(
+        'trivial', 300, params.batch_size, 0.005, params=params)
+
+  def add_inference(self, cnn):
+    cnn.reshape([-1, 300 * 300 * 3])
+    cnn.affine(1)
+    cnn.affine(4096)
+
+  def get_input_shapes(self, subset):
+    return [[self.batch_size, 300, 300, 3],
+            [self.batch_size, 8732, 4],
+            [self.batch_size, 8732, 1],
+            [self.batch_size]]
+
+  def loss_function(self, inputs, build_network_result):
+    images, _, _, labels = inputs
+    labels = tf.cast(labels, tf.int32)
+    return super(TrivialSSD300Model, self).loss_function(
+        (images, labels), build_network_result)

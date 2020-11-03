@@ -14,6 +14,8 @@
 # ==============================================================================
 """CNN builder."""
 
+from __future__ import absolute_import
+from __future__ import division
 from __future__ import print_function
 
 from collections import defaultdict
@@ -21,12 +23,18 @@ import contextlib
 
 import numpy as np
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
+# pylint: disable=g-direct-tensorflow-import
+import mlperf
 from tensorflow.python.layers import convolutional as conv_layers
 from tensorflow.python.layers import core as core_layers
+from tensorflow.python.layers import normalization as normalization_layers
 from tensorflow.python.layers import pooling as pooling_layers
 from tensorflow.python.training import moving_averages
+
+
+_data_format_to_channel_axis = {'NCHW': 1, 'NHWC': 3}
 
 
 class ConvNetBuilder(object):
@@ -161,6 +169,8 @@ class ConvNetBuilder(object):
       num_channels_in = self.top_size
     if stddev is not None and kernel_initializer is None:
       kernel_initializer = tf.truncated_normal_initializer(stddev=stddev)
+    if kernel_initializer is None:
+      kernel_initializer = tf.variance_scaling_initializer()
     name = 'conv' + str(self.counts['conv'])
     self.counts['conv'] += 1
     with tf.variable_scope(name):
@@ -191,14 +201,19 @@ class ConvNetBuilder(object):
                      [pad_w_beg, pad_w_end], [0, 0]]
           if self.data_format == 'NCHW':
             padding = [padding[0], padding[3], padding[1], padding[2]]
-          input_layer = tf.pad(input_layer, padding)
-          conv = self._conv2d_impl(input_layer, num_channels_in,
+          padded_input_layer = tf.pad(input_layer, padding)
+          conv = self._conv2d_impl(padded_input_layer, num_channels_in,
                                    num_out_channels,
                                    kernel_size=[k_height, k_width],
                                    strides=[d_height, d_width], padding='VALID',
                                    kernel_initializer=kernel_initializer)
       if use_batch_norm is None:
         use_batch_norm = self.use_batch_norm
+      mlperf.logger.log_conv2d(input_tensor=input_layer, output_tensor=conv,
+                               stride_height=d_height, stride_width=d_width,
+                               filters=num_out_channels,
+                               initializer=kernel_initializer,
+                               use_bias=not use_batch_norm and bias is not None)
       if not use_batch_norm:
         if bias is not None:
           biases = self.get_variable('biases', [num_out_channels],
@@ -214,6 +229,7 @@ class ConvNetBuilder(object):
         self.top_size = num_out_channels
         biased = self.batch_norm(**self.batch_norm_config)
       if activation == 'relu':
+        mlperf.logger.log(key=mlperf.tags.MODEL_HP_RELU)
         conv1 = tf.nn.relu(biased)
       elif activation == 'linear' or activation is None:
         conv1 = biased
@@ -257,6 +273,9 @@ class ConvNetBuilder(object):
         strides = [1, 1, d_height, d_width]
       pool = tf.nn.max_pool(input_layer, ksize, strides, padding=mode,
                             data_format=self.data_format, name=name)
+    if pool_name == 'mpool':
+      mlperf.logger.log_max_pool(input_tensor=input_layer,
+                                 output_tensor=pool)
     self.top_layer = pool
     return pool
 
@@ -315,8 +334,11 @@ class ConvNetBuilder(object):
       biases = self.get_variable('biases', [num_out_channels],
                                  self.variable_dtype, self.dtype,
                                  initializer=tf.constant_initializer(bias))
+      mlperf.logger.log(key=mlperf.tags.MODEL_HP_DENSE,
+                        value=num_out_channels)
       logits = tf.nn.xw_plus_b(input_layer, kernel, biases)
       if activation == 'relu':
+        mlperf.logger.log(key=mlperf.tags.MODEL_HP_RELU)
         affine1 = tf.nn.relu(logits, name=name)
       elif activation == 'linear' or activation is None:
         affine1 = logits
@@ -441,22 +463,30 @@ class ConvNetBuilder(object):
     name = 'batchnorm' + str(self.counts['batchnorm'])
     self.counts['batchnorm'] += 1
 
+    center = True
     with tf.variable_scope(name) as scope:
       if self.use_tf_layers:
-        bn = tf.contrib.layers.batch_norm(
-            input_layer,
-            decay=decay,
+        layer_obj = normalization_layers.BatchNormalization(
+            momentum=decay,
             scale=scale,
             epsilon=epsilon,
-            is_training=self.phase_train,
             fused=True,
-            data_format=self.data_format,
-            scope=scope)
+            axis=_data_format_to_channel_axis[self.data_format],
+            # We pass this 'scope' argument for compatibility with checkpoints
+            # created with the contrib version of batch norm. tf_cnn_benchmarks
+            # used to use the contrib version.
+            _scope=scope,
+            center=center,
+            name=scope.name)
+        bn = layer_obj.apply(input_layer, training=self.phase_train)
       else:
         bn = self._batch_norm_without_layers(input_layer, decay, scale, epsilon)
     self.top_layer = bn
     self.top_size = bn.shape[3] if self.data_format == 'NHWC' else bn.shape[1]
     self.top_size = int(self.top_size)
+    mlperf.logger.log_batch_norm(
+        input_tensor=input_layer, output_tensor=bn, momentum=decay,
+        epsilon=epsilon, center=center, scale=scale, training=self.phase_train)
     return bn
 
   def lrn(self, depth_radius, bias, alpha, beta):

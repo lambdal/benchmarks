@@ -14,11 +14,17 @@
 # ==============================================================================
 """Base model configuration for CNN benchmarks."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 from collections import namedtuple
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 import convnet_builder
+import mlperf
+from tensorflow.python.ops import variables as variables_module  # pylint: disable=g-direct-tensorflow-import
 
 # BuildNetworkResult encapsulate the result (e.g. logits) of a
 # Model.build_network() call.
@@ -52,9 +58,11 @@ class Model(object):
     if params:
       self.use_tf_layers = params.use_tf_layers
       self.fp16_vars = params.fp16_vars
+      self.data_type = tf.float16 if params.use_fp16 else tf.float32
     else:
       self.use_tf_layers = True
       self.fp16_vars = False
+      self.data_type = tf.float32
 
   def get_model_name(self):
     return self.model_name
@@ -71,32 +79,48 @@ class Model(object):
   def get_fp16_loss_scale(self):
     return self.fp16_loss_scale
 
+  def filter_l2_loss_vars(self, variables):
+    """Filters out variables that the L2 loss should not be computed for.
+
+    By default, this filters out batch normalization variables and keeps all
+    other variables. This behavior can be overridden by subclasses.
+
+    Args:
+      variables: A list of the trainable variables.
+
+    Returns:
+      A list of variables that the L2 loss should be computed for.
+    """
+    mlperf.logger.log(key=mlperf.tags.MODEL_EXCLUDE_BN_FROM_L2,
+                      value=True)
+    return [v for v in variables if 'batchnorm' not in v.name]
+
   def get_learning_rate(self, global_step, batch_size):
     del global_step
     del batch_size
     return self.learning_rate
 
-  def get_labels_shape(self):
-    """Returns the expected shape of labels to this model."""
-    return None
-
-  def get_input_shape(self):
-    """Returns the expected shape of the input to this model."""
+  def get_input_shapes(self, subset):
+    """Returns the list of expected shapes of all the inputs to this model."""
+    del subset
     raise NotImplementedError('Must be implemented in derived classes')
 
-  def get_synthetic_inputs_and_labels(self, input_name, data_type, nclass):
-    """Returns the ops to generate synthetic inputs and labels."""
+  def get_input_data_types(self, subset):
+    """Returns the list of data types of all the inputs to this model."""
+    del subset
     raise NotImplementedError('Must be implemented in derived classes')
 
-  def build_network(self, inputs, phase_train, nclass, data_type=tf.float32):
+  def get_synthetic_inputs(self, input_name, nclass):
+    """Returns the ops to generate synthetic inputs."""
+    raise NotImplementedError('Must be implemented in derived classes')
+
+  def build_network(self, inputs, phase_train, nclass):
     """Builds the forward pass of the model.
 
     Args:
-      inputs: The inputs
+      inputs: The list of inputs, including labels
       phase_train: True during training. False during evaluation.
       nclass: Number of classes that the inputs can belong to.
-      data_type: The dtype to run the model in: tf.float32 or tf.float16. The
-        variable dtype is controlled by a separate parameter: self.fp16_vars.
 
     Returns:
       A BuildNetworkResult which contains the logits and model-specific extra
@@ -104,17 +128,30 @@ class Model(object):
     """
     raise NotImplementedError('Must be implemented in derived classes')
 
-  def loss_function(self, build_network_result, labels):
-    """Returns the op to measure the loss of the model."""
+  def loss_function(self, inputs, build_network_result):
+    """Returns the op to measure the loss of the model.
+
+    Args:
+      inputs: the input list of the model.
+      build_network_result: a BuildNetworkResult returned by build_network().
+
+    Returns:
+      The loss tensor of the model.
+    """
     raise NotImplementedError('Must be implemented in derived classes')
 
-  def accuracy_function(self, logits, labels, data_type):
+  # TODO(laigd): have accuracy_function() take build_network_result instead.
+  def accuracy_function(self, inputs, logits):
     """Returns the ops to measure the accuracy of the model."""
     raise NotImplementedError('Must be implemented in derived classes')
 
   def postprocess(self, results):
     """Postprocess results returned from model in Python."""
     return results
+
+  def reached_target(self):
+    """Define custom methods to stop training when model's target is reached."""
+    return False
 
 
 class CNNModel(Model):
@@ -131,15 +168,13 @@ class CNNModel(Model):
                fp16_loss_scale=128,
                params=None):
     super(CNNModel, self).__init__(
-        model, batch_size, learning_rate, fp16_loss_scale, params=params)
+        model, batch_size, learning_rate, fp16_loss_scale,
+        params=params)
     self.image_size = image_size
     self.layer_counts = layer_counts
     self.depth = 3
     self.params = params
     self.data_format = params.data_format if params else 'NCHW'
-
-  def get_labels_shape(self):
-    return [self.get_batch_size()]
 
   def get_layer_counts(self):
     return self.layer_counts
@@ -192,85 +227,81 @@ class CNNModel(Model):
     del cnn
     raise NotImplementedError('Must be implemented in derived classes')
 
-  def get_input_shape(self):
-    # (height, width, depth)
-    return [self.image_size, self.image_size, self.depth]
+  def get_input_data_types(self, subset):
+    """Return data types of inputs for the specified subset."""
+    del subset  # Same types for both 'train' and 'validation' subsets.
+    return [self.data_type, tf.int32]
 
-  def get_synthetic_inputs_and_labels(self, input_name, data_type, nclass):
+  def get_input_shapes(self, subset):
+    """Return data shapes of inputs for the specified subset."""
+    del subset  # Same shapes for both 'train' and 'validation' subsets.
+    # Each input is of shape [batch_size, height, width, depth]
+    # Each label is of shape [batch_size]
+    return [[self.batch_size, self.image_size, self.image_size, self.depth],
+            [self.batch_size]]
+
+  def get_synthetic_inputs(self, input_name, nclass):
     # Synthetic input should be within [0, 255].
+    image_shape, label_shape = self.get_input_shapes('train')
     inputs = tf.truncated_normal(
-        [self.batch_size] + self.get_input_shape(),
-        dtype=data_type,
+        image_shape,
+        dtype=self.data_type,
         mean=127,
         stddev=60,
         name=self.model_name + '_synthetic_inputs')
-    inputs = tf.contrib.framework.local_variable(inputs, name=input_name)
+    inputs = variables_module.VariableV1(
+        inputs, trainable=False, collections=[tf.GraphKeys.LOCAL_VARIABLES],
+        name=input_name)
     labels = tf.random_uniform(
-        [self.batch_size],
+        label_shape,
         minval=0,
         maxval=nclass - 1,
         dtype=tf.int32,
         name=self.model_name + '_synthetic_labels')
     return (inputs, labels)
 
-  def get_synthetic_inputs_and_labels_coco(self, input_name, data_type, nclass,
-                                           labels_shape):
-    inputs = tf.truncated_normal(
-        [self.batch_size] + self.get_input_shape(),
-        dtype=data_type,
-        mean=127,
-        stddev=60,
-        name=self.model_name + '_synthetic_inputs')
-    inputs = tf.contrib.framework.local_variable(inputs, name=input_name)
-    # labels = tf.random_uniform(
-    #     labels_shape,
-    #     minval=0,
-    #     maxval=1,
-    #     dtype=tf.float32,
-    #     name=self.model_name + '_synthetic_labels')
-    labels = tf.ones(
-        labels_shape,
-        dtype=tf.float32,
-        name=self.model_name + '_synthetic_labels')
-    return (inputs, labels)
+  def gpu_preprocess_nhwc(self, images, phase_train=True):
+    del phase_train
+    return images
 
   def build_network(self,
                     inputs,
                     phase_train=True,
-                    nclass=1001,
-                    data_type=tf.float32):
+                    nclass=1001):
     """Returns logits from input images.
 
     Args:
-      inputs: The input images
+      inputs: The input images and labels
       phase_train: True during training. False during evaluation.
       nclass: Number of classes that the images can belong to.
-      data_type: The dtype to run the model in: tf.float32 or tf.float16. The
-        variable dtype is controlled by a separate parameter: self.fp16_vars.
 
     Returns:
       A BuildNetworkResult which contains the logits and model-specific extra
         information.
     """
+    images = inputs[0]
+    images = self.gpu_preprocess_nhwc(images, phase_train)
     if self.data_format == 'NCHW':
-      inputs = tf.transpose(inputs, [0, 3, 1, 2])
+      images = tf.transpose(images, [0, 3, 1, 2])
     var_type = tf.float32
-    if data_type == tf.float16 and self.fp16_vars:
+    if self.data_type == tf.float16 and self.fp16_vars:
       var_type = tf.float16
     network = convnet_builder.ConvNetBuilder(
-        inputs, self.depth, phase_train, self.use_tf_layers, self.data_format,
-        data_type, var_type)
+        images, self.depth, phase_train, self.use_tf_layers, self.data_format,
+        self.data_type, var_type)
     with tf.variable_scope('cg', custom_getter=network.get_custom_getter()):
       self.add_inference(network)
       # Add the final fully-connected class layer
       logits = (
           network.affine(nclass, activation='linear')
           if not self.skip_final_affine_layer() else network.top_layer)
+      mlperf.logger.log(key=mlperf.tags.MODEL_HP_FINAL_SHAPE,
+                        value=logits.shape.as_list()[1:])
       aux_logits = None
       if network.aux_top_layer is not None:
         with network.switch_to_aux_top_layer():
           aux_logits = network.affine(nclass, activation='linear', stddev=0.001)
-    if data_type == tf.float16:
+    if self.data_type == tf.float16:
       # TODO(reedwm): Determine if we should do this cast here.
       logits = tf.cast(logits, tf.float32)
       if aux_logits is not None:
@@ -278,14 +309,16 @@ class CNNModel(Model):
     return BuildNetworkResult(
         logits=logits, extra_info=None if aux_logits is None else aux_logits)
 
-  def loss_function(self, build_network_result, labels):
+  def loss_function(self, inputs, build_network_result):
     """Returns the op to measure the loss of the model."""
     logits = build_network_result.logits
-    # TODO(laigd): consider putting the aux logit logic in the Inception model,
+    _, labels = inputs
+    # TODO(laigd): consider putting the aux logit in the Inception model,
     # which could call super.loss_function twice, once with the normal logits
     # and once with the aux logits.
     aux_logits = build_network_result.extra_info
     with tf.name_scope('xentropy'):
+      mlperf.logger.log(key=mlperf.tags.MODEL_HP_LOSS_FN, value=mlperf.tags.CCE)
       cross_entropy = tf.losses.sparse_softmax_cross_entropy(
           logits=logits, labels=labels)
       loss = tf.reduce_mean(cross_entropy, name='xentropy_mean')
@@ -297,10 +330,11 @@ class CNNModel(Model):
         loss = tf.add_n([loss, aux_loss])
     return loss
 
-  def accuracy_function(self, logits, labels, data_type):
+  def accuracy_function(self, inputs, logits):
     """Returns the ops to measure the accuracy of the model."""
+    _, labels = inputs
     top_1_op = tf.reduce_sum(
-        tf.cast(tf.nn.in_top_k(logits, labels, 1), data_type))
+        tf.cast(tf.nn.in_top_k(logits, labels, 1), self.data_type))
     top_5_op = tf.reduce_sum(
-        tf.cast(tf.nn.in_top_k(logits, labels, 5), data_type))
+        tf.cast(tf.nn.in_top_k(logits, labels, 5), self.data_type))
     return {'top_1_accuracy': top_1_op, 'top_5_accuracy': top_5_op}

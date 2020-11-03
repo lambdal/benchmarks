@@ -23,14 +23,16 @@ from contextlib import contextmanager
 import os
 
 import numpy as np
-import tensorflow as tf
-from tensorflow.python.platform import test
+import tensorflow.compat.v1 as tf
 import benchmark_cnn
 import cnn_util
 import datasets
 import preprocessing
 from models import model
 from platforms import util as platforms_util
+from test_data import tfrecord_image_generator
+from tensorflow.core.protobuf import rewriter_config_pb2  # pylint: disable=g-direct-tensorflow-import
+from tensorflow.python.platform import test
 
 
 @contextmanager
@@ -139,27 +141,26 @@ def get_evaluation_outputs_from_logs(logs):
 
   Args:
     logs: A list of strings, each which is a line from the standard output of
-      tf_cnn_benchmarks from evaluation. Only the line in the form:
+      tf_cnn_benchmarks from evaluation. Only lines in the form:
         Accuracy @ 1 = 0.5000 Accuracy @ 5 = 1.0000 [80 examples]
-      is parsed. The log should only contain one such line.
+      is parsed.
   Returns:
-    An EvalOutput.
+    A list of EvalOutputs. Normally this list only has one EvalOutput, but can
+    contain multiple if training is done and
+    --eval_during_training_every_n_steps is specified.
   """
-  top_1_accuracy = None
-  top_5_accuracy = None
+  eval_outputs = []
   for log in logs:
     if 'Accuracy @ ' in log:
       # Example log:
       #   Accuracy @ 1 = 0.5000 Accuracy @ 5 = 1.0000 [80 examples]
       parts = log.split()
       assert len(parts) == 12
-      assert top_1_accuracy is None
-      assert top_5_accuracy is None
       top_1_accuracy = float(parts[4])
       top_5_accuracy = float(parts[9])
-  assert top_1_accuracy is not None
-  assert top_5_accuracy is not None
-  return EvalOutput(top_1_accuracy, top_5_accuracy)
+      eval_outputs.append(EvalOutput(top_1_accuracy, top_5_accuracy))
+  assert eval_outputs
+  return eval_outputs
 
 
 def check_training_outputs_are_reasonable(testcase, training_outputs,
@@ -291,7 +292,9 @@ def train_and_eval(testcase,
   eval_logs = run_fn('Evaluation', params)
   testcase.assertGreaterEqual(len(eval_logs), 1)
   for lines in eval_logs:
-    top_1_accuracy, top_5_accuracy = get_evaluation_outputs_from_logs(lines)
+    eval_outputs = get_evaluation_outputs_from_logs(lines)
+    assert len(eval_outputs) == 1
+    top_1_accuracy, top_5_accuracy = eval_outputs[0]
     if check_output_values:
       testcase.assertEqual(top_1_accuracy, 1.0)
       testcase.assertEqual(top_5_accuracy, 1.0)
@@ -303,9 +306,16 @@ def get_temp_dir(dir_name):
   return dir_path
 
 
+def create_black_and_white_images():
+  dir_path = get_temp_dir('black_and_white_images')
+  tfrecord_image_generator.write_black_and_white_tfrecord_data(dir_path,
+                                                               num_classes=1)
+  return dir_path
+
+
 def get_params(train_dir_name):
   """Returns params that can be used to train."""
-  return benchmark_cnn.make_params(
+  params = benchmark_cnn.make_params(
       batch_size=2,
       display_every=1,
       init_learning_rate=0.005,
@@ -317,12 +327,15 @@ def get_params(train_dir_name):
       print_training_accuracy=True,
       train_dir=get_temp_dir(train_dir_name),
       variable_update='parameter_server',
-      weight_decay=0)
+      weight_decay=0,
+      distortions=True,
+      distort_color_in_yiq=False)
+  return benchmark_cnn.set_default_param_values_and_env_vars(params)
 
 
 def get_var_update_params():
   """Returns params that are used when testing variable updates."""
-  return benchmark_cnn.make_params(
+  params = benchmark_cnn.make_params(
       batch_size=2,
       model='test_model',
       num_gpus=2,
@@ -332,6 +345,7 @@ def get_var_update_params():
       weight_decay=2 ** -4,
       init_learning_rate=2 ** -4,
       optimizer='sgd')
+  return benchmark_cnn.set_default_param_values_and_env_vars(params)
 
 
 def get_fake_var_update_inputs():
@@ -412,7 +426,10 @@ def manually_compute_losses(numpy_inputs, inputs_placeholder, loss, num_workers,
                      for i in range(num_workers)]
   # Set the GPU count to 0, to avoid taking all the GPU memory. Unfortunately,
   # doing so still takes up about ~1GB for some reason.
-  with tf.Session(config=tf.ConfigProto(device_count={'GPU': 0})) as sess:
+  config = tf.ConfigProto(device_count={'GPU': 0})
+  config.graph_options.rewrite_options.pin_to_host_optimization = (
+      rewriter_config_pb2.RewriterConfig.OFF)
+  with tf.Session(config=config) as sess:
     sess.run(tf.global_variables_initializer())
     losses = [[] for _ in range(num_workers)]
     for i in range(params.num_batches):
@@ -447,6 +464,7 @@ class TestCNNModel(model.CNNModel):
   def __init__(self):
     super(TestCNNModel, self).__init__(
         'test_cnn_model', image_size=1, batch_size=1, learning_rate=1)
+    self.depth = 1
 
   VAR_A_INITIAL_VALUE = 1.
   VAR_B_INITIAL_VALUE = 2.
@@ -470,8 +488,8 @@ class TestCNNModel(model.CNNModel):
   def skip_final_affine_layer(self):
     return True
 
-  def loss_function(self, build_network_result, labels):
-    del labels
+  def loss_function(self, inputs, build_network_result):
+    del inputs
     return tf.reduce_mean(build_network_result.logits)
 
   def manually_compute_losses(self, inputs, num_workers, params):
@@ -483,11 +501,16 @@ class TestCNNModel(model.CNNModel):
                                           name='inputs_placeholder')
       inputs_reshaped = tf.reshape(inputs_placeholder, (-1, 1))
       loss = self.loss_function(
+          None,
           model.BuildNetworkResult(logits=inputs_reshaped * a * b,
-                                   extra_info=None),
-          None)
+                                   extra_info=None))
       return manually_compute_losses(inputs, inputs_placeholder, loss,
                                      num_workers, params)
+
+  def accuracy_function(self, inputs, logits):
+    del inputs
+    # Let the accuracy be the same as the loss function.
+    return {'top_1_accuracy': logits, 'top_5_accuracy': logits}
 
 
 class TestDataSet(datasets.ImageDataset):

@@ -22,21 +22,26 @@ import itertools as it
 import math
 
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-from tensorflow.contrib.data.python.ops import batching
-# from object_detection.box_coders import faster_rcnn_box_coder
-# from object_detection.core import box_list
-# from object_detection.core import preprocessor
-# from object_detection.core import region_similarity_calculator
-# from object_detection.core import target_assigner
-# from object_detection.data_decoders import tf_example_decoder
-# from object_detection.matchers import argmax_matcher
+
+from object_detection.box_coders import faster_rcnn_box_coder
+from object_detection.core import box_list
+from object_detection.core import region_similarity_calculator
+from object_detection.core import target_assigner
+from object_detection.matchers import argmax_matcher
+import mlperf
 import ssd_constants
 
 
 class DefaultBoxes(object):
-  """Default bounding boxes for 300x300 5 layer SSD"""
+  """Default bounding boxes for 300x300 5 layer SSD.
+
+  Default bounding boxes generation follows the order of (W, H, anchor_sizes).
+  Therefore, the tensor converted from DefaultBoxes has a shape of
+  [anchor_sizes, H, W, 4]. The last dimension is the box coordinates; 'ltrb'
+  is [ymin, xmin, ymax, xmax] while 'xywh' is [cy, cx, h, w].
+  """
 
   def __init__(self):
     fk = ssd_constants.IMAGE_SIZE / np.array(ssd_constants.STEPS)
@@ -59,13 +64,24 @@ class DefaultBoxes(object):
       for w, h in all_sizes:
         for i, j in it.product(range(feature_size), repeat=2):
           cx, cy = (j + 0.5) / fk[idx], (i + 0.5) / fk[idx]
-          box = tuple(np.clip(k, 0, 1) for k in (cx, cy, w, h))
+          box = tuple(np.clip(k, 0, 1) for k in (cy, cx, h, w))
           self.default_boxes.append(box)
 
     assert len(self.default_boxes) == ssd_constants.NUM_SSD_BOXES
 
-    def to_ltrb(cx, cy, w, h):
-      return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+    mlperf.logger.log(key=mlperf.tags.FEATURE_SIZES,
+                      value=ssd_constants.FEATURE_SIZES)
+    mlperf.logger.log(key=mlperf.tags.STEPS,
+                      value=ssd_constants.STEPS)
+    mlperf.logger.log(key=mlperf.tags.SCALES,
+                      value=ssd_constants.SCALES)
+    mlperf.logger.log(key=mlperf.tags.ASPECT_RATIOS,
+                      value=ssd_constants.ASPECT_RATIOS)
+    mlperf.logger.log(key=mlperf.tags.NUM_DEFAULTS,
+                      value=ssd_constants.NUM_SSD_BOXES)
+
+    def to_ltrb(cy, cx, h, w):
+      return cy - h / 2, cx - w / 2, cy + h / 2, cx + w / 2
 
     # For IoU calculation
     self.default_boxes_ltrb = tuple(to_ltrb(*i) for i in self.default_boxes)
@@ -75,43 +91,128 @@ class DefaultBoxes(object):
     if order == 'xywh': return self.default_boxes
 
 
-def calc_iou_tensor(box1, box2):
-  """ Calculation of IoU based on two boxes tensor,
-      Reference to https://github.com/kuangliu/pytorch-ssd
-      input:
-          box1 (N, 4)
-          box2 (M, 4)
-      output:
-          IoU (N, M)
+def calc_iou_tensor(boxes1, boxes2):
+  """Calculation of IoU based on two boxes tensor.
+
+  Reference to https://github.com/kuangliu/pytorch-ssd
+
+  Args:
+    boxes1: shape (N, 4), four coordinates of N boxes
+    boxes2: shape (M, 4), four coordinates of M boxes
+  Returns:
+    IoU: shape (N, M), IoU of the i-th box in `boxes1` and j-th box in `boxes2`
   """
-  N = tf.shape(box1)[0]
-  M = tf.shape(box2)[0]
+  b1_left, b1_top, b1_right, b1_bottom = tf.split(boxes1, 4, axis=1)
+  b2_left, b2_top, b2_right, b2_bottom = tf.split(boxes2, 4, axis=1)
 
-  be1 = tf.tile(tf.expand_dims(box1, axis=1), (1, M, 1))
-  be2 = tf.tile(tf.expand_dims(box2, axis=0), (N, 1, 1))
+  # Shape of intersect_* (N, M)
+  intersect_left = tf.maximum(b1_left, tf.transpose(b2_left))
+  intersect_top = tf.maximum(b1_top, tf.transpose(b2_top))
+  intersect_right = tf.minimum(b1_right, tf.transpose(b2_right))
+  intersect_bottom = tf.minimum(b1_bottom, tf.transpose(b2_bottom))
 
-  # Left Top & Right Bottom
-  lt = tf.maximum(be1[:, :, :2], be2[:, :, :2])
+  boxes1_area = (b1_right - b1_left) * (b1_bottom - b1_top)
+  boxes2_area = (b2_right - b2_left) * (b2_bottom - b2_top)
 
-  rb = tf.minimum(be1[:, :, 2:], be2[:, :, 2:])
+  intersect = tf.multiply(tf.maximum((intersect_right - intersect_left), 0),
+                          tf.maximum((intersect_bottom - intersect_top), 0))
+  union = boxes1_area + tf.transpose(boxes2_area) - intersect
+  iou = intersect / union
 
-  delta = tf.maximum(rb - lt, 0)
-
-  intersect = delta[:, :, 0] * delta[:, :, 1]
-
-  delta1 = be1[:, :, 2:] - be1[:, :, :2]
-  area1 = delta1[:, :, 0] * delta1[:, :, 1]
-  delta2 = be2[:, :, 2:] - be2[:, :, :2]
-  area2 = delta2[:, :, 0] * delta2[:, :, 1]
-
-  iou = intersect/(area1 + area2 - intersect)
   return iou
 
 
-def ssd_crop(image, boxes, classes):
-  """IoU biassed random crop.
+def ssd_parse_example_proto(example_serialized):
+  """Parses an Example proto containing a training example of an image.
+
+  Each Example proto contains the following fields that we care about:
+
+    image/encoded: <JPEG encoded string>
+    image/source_id: tf.string
+    image/height: tf.int64
+    image/width: tf.int64
+    image/object/bbox/xmin: tf.VarLenFeature(tf.float32)
+    image/object/bbox/xmax: tf.VarLenFeature(tf.float32)
+    image/object/bbox/ymin: tf.VarLenFeature(tf.float32
+    image/object/bbox/ymax: tf.VarLenFeature(tf.float32)
+    image/object/class/label: tf.VarLenFeature(tf.int64)
+    image/object/class/text: tf.VarLenFeature(tf.string)
+
+  Complete decoder can be found in:
+  https://github.com/tensorflow/models/blob/master/research/object_detection/data_decoders/tf_example_decoder.py
+
+  Args:
+    example_serialized: scalar Tensor tf.string containing a serialized
+      Example protocol buffer.
+
+  Returns:
+    A dictionary with the following key-values:
+    image_buffer: Tensor tf.string containing the contents of a JPEG file.
+    groundtruth_boxes: Tensor tf.float32 of shape [num_boxes, 4], containing
+      coordinates of object bounding boxes.
+    groundtruth_classeS: Tensor tf.int64 of shape [num_boxes, 1], containing
+      class labels of objects.
+    source_id: unique image identifier.
+    raw_shape: [height, width, 3].
+  """
+  feature_map = {
+      'image/encoded': tf.FixedLenFeature(
+          (), dtype=tf.string, default_value=''),
+      'image/source_id': tf.FixedLenFeature((), tf.string, default_value=''),
+      'image/height': tf.FixedLenFeature((), tf.int64, default_value=1),
+      'image/width': tf.FixedLenFeature((), tf.int64, default_value=1),
+      'image/object/bbox/xmin': tf.VarLenFeature(dtype=tf.float32),
+      'image/object/bbox/ymin': tf.VarLenFeature(dtype=tf.float32),
+      'image/object/bbox/xmax': tf.VarLenFeature(dtype=tf.float32),
+      'image/object/bbox/ymax': tf.VarLenFeature(dtype=tf.float32),
+      'image/object/class/label': tf.VarLenFeature(dtype=tf.int64),
+  }
+  features = tf.parse_single_example(example_serialized, feature_map)
+
+  xmin = tf.expand_dims(features['image/object/bbox/xmin'].values, 1)
+  ymin = tf.expand_dims(features['image/object/bbox/ymin'].values, 1)
+  xmax = tf.expand_dims(features['image/object/bbox/xmax'].values, 1)
+  ymax = tf.expand_dims(features['image/object/bbox/ymax'].values, 1)
+
+  image_buffer = features['image/encoded']
+  # Bounding box coordinates should be in ltrb order
+  boxes = tf.concat([ymin, xmin, ymax, xmax], 1)
+  classes = tf.expand_dims(features['image/object/class/label'].values, 1)
+  source_id = features['image/source_id']
+  raw_shape = tf.stack([features['image/height'], features['image/width'], 3])
+
+  return {'image_buffer': image_buffer,
+          'groundtruth_boxes': boxes,
+          'groundtruth_classes': classes,
+          'source_id': source_id,
+          'raw_shape': raw_shape}
+
+
+def ssd_decode_and_crop(image_buffer, boxes, classes, raw_shape):
+  """Crop image randomly and decode the cropped region.
+
+  This function will crop an image to meet the following requirements:
+  1. height to width ratio between 0.5 and 2;
+  2. IoUs of some boxes exceed specified threshold;
+  3. At least one box center is in the cropped region.
+  We defer the jpeg decoding task until after the crop to avoid wasted work.
 
   Reference: https://github.com/chauhan-utk/ssd.DomainAdaptation
+
+  Args:
+    image_buffer: Tensor tf.string containing the contents of a JPEG file.
+    boxes: Tensor tf.float32 of shape [num_boxes, 4], containing coordinates of
+      object bounding boxes.
+    classes: Tensor tf.int64 of shape [num_boxes, 1], containing class labels
+      of objects.
+    raw_shape: [height, width, 3].
+
+  Returns:
+    resized_image: decoded, cropped, and resized image Tensor tf.float32 of
+      shape [ssd_constants.IMAGE_SIZE, ssd_constants.IMAGE_SIZE, 3], value
+      range 0--255.
+    cropped_boxes: box coordinates for objects in the cropped region.
+    cropped_classes: class labels for objects in the cropped region.
   """
 
   num_boxes = tf.shape(boxes)[0]
@@ -156,7 +257,7 @@ def ssd_crop(image, boxes, classes):
 
     # Checks of whether a crop is valid.
     valid_aspect = tf.logical_and(tf.less(height/width, 2),
-                                  tf.less(height/width, 2))
+                                  tf.less(width/height, 2))
     valid_ious = tf.reduce_all(tf.greater(ious, min_iou), axis=1, keepdims=True)
     valid_masks = tf.reduce_any(masks, axis=1, keepdims=True)
 
@@ -192,6 +293,9 @@ def ssd_crop(image, boxes, classes):
 
   filtered_boxes = tf.boolean_mask(boxes, box_masks, axis=0)
 
+  mlperf.logger.log(key=mlperf.tags.NUM_CROPPING_ITERATIONS,
+                    value=ssd_constants.NUM_CROP_PASSES)
+
   # Clip boxes to the cropped region.
   filtered_boxes = tf.stack([
       tf.maximum(filtered_boxes[:, 0], crop_bounds[0]),
@@ -212,165 +316,91 @@ def ssd_crop(image, boxes, classes):
       (filtered_boxes[:, 3] - top) / height,
   ], axis=1)
 
-  cropped_image = tf.image.crop_and_resize(
-      image=image[tf.newaxis, :, :, :],
-      boxes=crop_bounds[tf.newaxis, :],
-      box_ind=tf.zeros((1,), tf.int32),
-      crop_size=(ssd_constants.IMAGE_SIZE, ssd_constants.IMAGE_SIZE),
-  )[0, :, :, :]
+  # crop_window containing integer coordinates of cropped region. A normalized
+  # coordinate value of y should be mapped to the image coordinate at
+  # y * (height - 1).
+  raw_shape = tf.cast(raw_shape, tf.float32)
+  crop_window = tf.stack([left * (raw_shape[0] - 1),
+                          top * (raw_shape[1] - 1),
+                          width * raw_shape[0],
+                          height * raw_shape[1]])
+  crop_window = tf.cast(crop_window, tf.int32)
+
+  # Fused op only decodes the cropped portion of an image
+  cropped_image = tf.image.decode_and_crop_jpeg(
+      image_buffer, crop_window, channels=3)
+
+  # Resize converts image dtype from uint8 to float32, without rescaling values.
+  resized_image = tf.image.resize_images(
+      cropped_image, [ssd_constants.IMAGE_SIZE, ssd_constants.IMAGE_SIZE])
+  mlperf.logger.log(key=mlperf.tags.INPUT_SIZE,
+                    value=ssd_constants.IMAGE_SIZE)
 
   cropped_classes = tf.boolean_mask(classes, box_masks, axis=0)
 
-  return cropped_image, cropped_boxes, cropped_classes
+  return resized_image, cropped_boxes, cropped_classes
 
 
-def normalize_image(image):
-  """Normalize the image to zero mean and unit variance."""
-  image -= tf.constant(
-      ssd_constants.NORMALIZATION_MEAN)[tf.newaxis, tf.newaxis, :]
-
-  image /= tf.constant(
-      ssd_constants.NORMALIZATION_STD)[tf.newaxis, tf.newaxis, :]
-
-  return image
-
-
-def encode_labels(boxes, classes):
-  similarity_calc = region_similarity_calculator.IouSimilarity()
-  matcher = argmax_matcher.ArgMaxMatcher(
-      matched_threshold=ssd_constants.MATCH_THRESHOLD,
-      unmatched_threshold=ssd_constants.MATCH_THRESHOLD,
-      negatives_lower_than_unmatched=True,
-      force_match_for_each_row=True)
-
-  box_coder = faster_rcnn_box_coder.FasterRcnnBoxCoder(
-      scale_factors=ssd_constants.BOX_CODER_SCALES)
-
-  default_boxes = box_list.BoxList(tf.convert_to_tensor(DefaultBoxes()('ltrb')))
-  target_boxes = box_list.BoxList(boxes)
-
-  assigner = target_assigner.TargetAssigner(
-      similarity_calc, matcher, box_coder)
-
-  return assigner.assign(default_boxes, target_boxes, classes)
+def color_jitter(image, brightness=0, contrast=0, saturation=0, hue=0):
+  """Distort the color of the image."""
+  with tf.name_scope('distort_color'):
+    if brightness > 0:
+      image = tf.image.random_brightness(image, max_delta=brightness)
+    if contrast > 0:
+      image = tf.image.random_contrast(
+          image, lower=1-contrast, upper=1+contrast)
+    if saturation > 0:
+      image = tf.image.random_saturation(
+          image, lower=1-saturation, upper=1+saturation)
+    if hue > 0:
+      image = tf.image.random_hue(image, max_delta=hue)
+    return image
 
 
-class SSDInputReader(object):
-  """Input reader for dataset."""
+def normalize_image(images):
+  """Normalize image to zero mean and unit variance.
 
-  def __init__(self, file_pattern, is_training):
-    self._file_pattern = file_pattern
-    self._is_training = is_training
+  Args:
+    images: a tensor representing images, at least 3-D.
+  Returns:
+    images normalized by mean and stdev.
+  """
+  data_type = images.dtype
+  mean = tf.constant(ssd_constants.NORMALIZATION_MEAN, data_type)
+  std = tf.constant(ssd_constants.NORMALIZATION_STD, data_type)
+  images = tf.divide(tf.subtract(images, mean), std)
 
-  def __call__(self, params):
-    example_decoder = tf_example_decoder.TfExampleDecoder()
+  mlperf.logger.log(key=mlperf.tags.DATA_NORMALIZATION_MEAN,
+                    value=ssd_constants.NORMALIZATION_MEAN)
+  mlperf.logger.log(key=mlperf.tags.DATA_NORMALIZATION_STD,
+                    value=ssd_constants.NORMALIZATION_STD)
+  return images
 
-    def _parse_example(data):
-      with tf.name_scope('augmentation'):
-        source_id = tf.string_to_number(data['source_id'])
-        image = tf.image.convert_image_dtype(data['image'], dtype=tf.float32)
-        raw_shape = tf.shape(image)
-        boxes = data['groundtruth_boxes']
-        classes = tf.reshape(data['groundtruth_classes'], [-1, 1])
 
-        # Only 80 of the 90 COCO classes are used.
-        class_map = tf.convert_to_tensor(ssd_constants.CLASS_MAP)
-        classes = tf.gather(class_map, classes)
-        classes = tf.cast(classes, dtype=tf.float32)
+class Encoder(object):
+  """Encoder for SSD boxes and labels."""
 
-        if self._is_training:
-          image, boxes, classes = ssd_crop(image, boxes, classes)
-          image, boxes = preprocessor.random_horizontal_flip(
-              image=image, boxes=boxes)
+  def __init__(self):
+    similarity_calc = region_similarity_calculator.IouSimilarity()
+    matcher = argmax_matcher.ArgMaxMatcher(
+        matched_threshold=ssd_constants.MATCH_THRESHOLD,
+        unmatched_threshold=ssd_constants.MATCH_THRESHOLD,
+        negatives_lower_than_unmatched=True,
+        force_match_for_each_row=True)
 
-          # TODO(someone in object detection): Color Jitter
-          image = normalize_image(image)
+    box_coder = faster_rcnn_box_coder.FasterRcnnBoxCoder(
+        scale_factors=ssd_constants.BOX_CODER_SCALES)
 
-          encoded_classes, _, encoded_boxes, _, _ = encode_labels(boxes,
-                                                                  classes)
+    self.default_boxes = DefaultBoxes()('ltrb')
+    self.default_boxes = box_list.BoxList(
+        tf.convert_to_tensor(self.default_boxes))
+    self.assigner = target_assigner.TargetAssigner(
+        similarity_calc, matcher, box_coder)
 
-          # TODO(haoyuzhang): measure or remove this overhead of concat
-          # Encode labels (number of boxes, coordinates of bounding boxes, and
-          # classes into a single tensor, in order to be compatible with
-          # staging area in data input pipeline.
-          # Step 1: pack box coordinates and classes together
-          #     [nboxes, 4] concat [nboxes, 1] ==> [nboxes, 5]
-          labels = tf.concat([encoded_boxes, encoded_classes], 1)
-          # Step 2 (HACK): repeat number of boxes (a scalar tensor) five times,
-          #                and pack result from Step 1 with it.
-          #     [nboxes, 5] concat [1, 5] ==> [nboxes + 1, 5]
-          nboxes = tf.shape(boxes)[0]                   # scalar, shape (,)
-          nboxes_1d = tf.tile(tf.expand_dims(nboxes, 0), [5])
-                                                        # 1D tensor, shape (5)
-          nboxes_2d = tf.expand_dims(nboxes_1d, 0)      # 2D tensor, shape (1,5)
-          labels = tf.concat([labels, tf.cast(nboxes_2d, tf.float32)], 0)
-          return image, labels
-
-        else:
-          image = tf.image.resize_images(
-              image[tf.newaxis, :, :, :],
-              size=(ssd_constants.IMAGE_SIZE, ssd_constants.IMAGE_SIZE)
-          )[0, :, :, :]
-
-          # TODO(someone in object detection): Color Jitter
-          image = normalize_image(image)
-
-          def trim_and_pad(inp_tensor):
-            """Limit the number of boxes, and pad if necessary."""
-            inp_tensor = inp_tensor[:ssd_constants.MAX_NUM_EVAL_BOXES]
-            num_pad = ssd_constants.MAX_NUM_EVAL_BOXES - tf.shape(inp_tensor)[0]
-            inp_tensor = tf.pad(inp_tensor, [[0, num_pad], [0, 0]])
-            return tf.reshape(inp_tensor, [ssd_constants.MAX_NUM_EVAL_BOXES,
-                                           inp_tensor.get_shape()[1]])
-
-          boxes, classes = trim_and_pad(boxes), trim_and_pad(classes)
-
-          # TODO(haoyuzhang): measure or remove this overhead of concat
-          # Encode labels into a single tensor, in order to be compatible with
-          # staging area in data input pipeline.
-          # Shape of boxes: [MAX_NUM_EVAL_BOXES, 4]
-          # Shape of classes: [MAX_NUM_EVAL_BOXES, 1]
-          # Shape of source_id: [] (scalar tensor)
-          # Shape of raw_shape: [3]
-          boxes_classes = tf.concat([boxes, classes], 1)
-          id_shape = tf.concat([tf.expand_dims(source_id, 0),
-                                tf.cast(raw_shape, tf.float32),
-                                tf.constant([0.])], 0)
-          # id_shape: [source_id, raw_shape_H, raw_shape_W, raw_shape_C, 0]
-          labels = tf.concat([boxes_classes, tf.expand_dims(id_shape, 0)], 0)
-          # Shape of labels: [MAX_NUM_EVAL_BOXES+1, 5]
-          return image, labels
-
-    batch_size_per_split = params['batch_size_per_split']
-    num_splits = params['num_splits']
-    dataset = tf.data.Dataset.list_files(
-        self._file_pattern, shuffle=self._is_training)
-    # Repeat for both training and validation datasets because the number of
-    # validation examples is typically not a multiply of batch size, and COCO
-    # metric requires all results to be collected before calculating metrics.
-    dataset = dataset.repeat()
-
-    # Prefetch data from files.
-    def _prefetch_dataset(filename):
-      dataset = tf.data.TFRecordDataset(filename).prefetch(batch_size_per_split)
-      return dataset
-    dataset = dataset.apply(
-        tf.contrib.data.parallel_interleave(
-            _prefetch_dataset, cycle_length=32, sloppy=self._is_training))
-
-    if self._is_training:
-      dataset = dataset.shuffle(64)
-
-    # Parse the fetched records to input tensors for model function.
-    dataset = dataset.map(example_decoder.decode, num_parallel_calls=64)
-
-    # TODO(taylorrobie): Confirm that this is MLPerf rules compliant.
-    dataset = dataset.filter(
-        lambda data: tf.greater(tf.shape(data['groundtruth_boxes'])[0], 0))
-    dataset = dataset.apply(batching.map_and_batch(
-        map_func=_parse_example,
-        batch_size=batch_size_per_split,
-        num_parallel_batches=num_splits,
-        drop_remainder=True))
-    dataset = dataset.prefetch(buffer_size=num_splits)
-    return dataset
+  def encode_labels(self, gt_boxes, gt_labels):
+    target_boxes = box_list.BoxList(gt_boxes)
+    encoded_classes, _, encoded_boxes, _, matches = self.assigner.assign(
+        self.default_boxes, target_boxes, gt_labels)
+    num_matched_boxes = tf.reduce_sum(
+        tf.cast(tf.not_equal(matches, -1), tf.float32))
+    return encoded_classes, encoded_boxes, num_matched_boxes

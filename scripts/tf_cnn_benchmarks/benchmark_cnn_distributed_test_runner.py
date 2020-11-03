@@ -21,9 +21,13 @@ such as being able to inject custom images during training. So instead, this
 file is spawned as a Python process, which supports the added functionality.
 """
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 from absl import flags as absl_flags
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import benchmark_cnn
 import flags
 import preprocessing
@@ -114,4 +118,5 @@ def main(_):
 
 
 if __name__ == '__main__':
+  tf.disable_v2_behavior()
   tf.app.run()

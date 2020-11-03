@@ -15,11 +15,16 @@
 
 """Utility code for the default platform."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import os
 import sys
 import tempfile
 
 import cnn_util
+from models import model_config
 
 
 _ROOT_PROJECT_DIR = os.path.dirname(cnn_util.__file__)
@@ -61,9 +66,17 @@ def get_test_data_dir():
   return os.path.join(_ROOT_PROJECT_DIR, 'test_data')
 
 
+def get_ssd_backborn_model_file():
+  raise NotImplementedError
+
+
+def get_ssd_backboard_data_dir():
+  raise NotImplementedError
+
+
 def _initialize(params, config_proto):
-  # Currently, no platform initialization needs to be done.
   del params, config_proto
+  model_config.register_tf1_models()
 
 
 _is_initalized = False
